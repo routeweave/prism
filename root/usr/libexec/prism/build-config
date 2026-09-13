@@ -895,22 +895,99 @@ local function direct_outbound()
 	return { type = "direct", tag = "direct", domain_resolver = "local" }
 end
 
+-- Go duration literal: one or more <number><unit> pairs ("5s", "1m30s").
+-- ASCII units only. sing-box also accepts "µs", but %a cannot match a
+-- multi-byte rune and nothing reaching this path has a use for it.
+local DURATION_UNITS = { ns = true, us = true, ms = true, s = true, m = true, h = true }
+local function valid_duration(v)
+	if type(v) ~= "string" or v == "" then return false end
+	local pos = 1
+	while pos <= #v do
+		local num, unit, nextpos = v:match("^(%d+%.?%d*)(%a+)()", pos)
+		if not num or not DURATION_UNITS[unit] then return false end
+		pos = nextpos
+	end
+	return true
+end
+
+-- "0", "0s", "0m0s" — the explicit opt-out. Spelled as a value the user can
+-- actually type, because an *empty* one is unreachable from the settings
+-- form: form.js removes the option when the field is cleared, and again when
+-- it is set to the declared default (`fval == null || fval == '' || (fval ==
+-- this.default && (this.optional || this.rmempty))` → `remove()`). So absent
+-- and empty cannot be made to mean different things here, and do not.
+local function is_zero_duration(v)
+	if v == "0" then return true end
+	if not valid_duration(v) then return false end
+	return tonumber((v:gsub("%a+", ""))) == 0
+end
+
+-- Dial timeout stamped on every proxy outbound. A node that *refuses* the
+-- connection fails its dial at once, and sing-box drops it from the urltest
+-- group's history (DeleteURLTestHistory in protocol/group/urltest.go), so
+-- Select() skips it and the next connection lands on a different member. A
+-- node that blackholes the SYN instead gets no such backstop: with no
+-- connect_timeout the dial waits out the kernel's SYN retry schedule with the
+-- client hung behind it, and because the member still holds valid history
+-- from its last good check, further connections keep being steered onto it.
+-- Bounding the dial turns that case into the refused one.
+--
+-- An absent UCI option means the shipped default, not "off".
+-- /etc/config/prism is a conffile, so an upgraded install never gains the new
+-- key on its own and would otherwise keep the unbounded behaviour
+-- indefinitely. `0` opts out; see is_zero_duration for why the opt-out is not
+-- spelled as an empty value.
+local CONNECT_TIMEOUT_DEFAULT = "5s"
+local _connect_timeout
+local function connect_timeout(c)
+	if _connect_timeout == nil then
+		local v = c:get("prism", "global", "connect_timeout")
+		if v == nil or v == "" then
+			v = CONNECT_TIMEOUT_DEFAULT
+		elseif is_zero_duration(v) then
+			v = ""
+		elseif not valid_duration(v) then
+			-- Fall back to the default rather than emitting nothing: a typo
+			-- should not silently drop the protection, and it must not reach
+			-- sing-box either, which would reject the whole config over it and
+			-- strand the user on the last working generation (see 0046) with
+			-- no visible reason.
+			io.stderr:write("prism build-config: connect_timeout '" .. tostring(v)
+				.. "' is not a duration (e.g. 5s); using "
+				.. CONNECT_TIMEOUT_DEFAULT .. "\n")
+			v = CONNECT_TIMEOUT_DEFAULT
+		end
+		_connect_timeout = v
+	end
+	if _connect_timeout == "" then return nil end
+	return _connect_timeout
+end
+
 -- Route one resolved node into the outbounds or endpoints list: strip the
 -- Prism-internal `_source` marker, divert `_is_endpoint` nodes (Prism-built
 -- WireGuard) into the top-level endpoints array, and warn on subscription
 -- WireGuard outbounds, which still use the legacy schema (they work on
 -- 1.12 but will not load on sing-box 1.13). Shared by build_basic_outbounds,
 -- build_outbounds and build_probe_config.
-local function place_node(ob, outbounds, endpoints)
+local function place_node(ob, outbounds, endpoints, timeout)
 	ob._source = nil
 	if ob._is_endpoint then
 		ob._is_endpoint = nil
+		-- Endpoints are Prism-built WireGuard, whose handshake is UDP and has
+		-- no TCP connect to bound. Left alone deliberately.
 		endpoints[#endpoints + 1] = ob
 	else
 		if ob.type == "wireguard" then
 			io.stderr:write("prism build-config: subscription WireGuard node '"
 				.. tostring(ob.tag) .. "' uses the legacy outbound schema; "
 				.. "it will not work on sing-box 1.13\n")
+		end
+		-- A group dials through a member rather than itself, so the timeout
+		-- belongs on the members (which pass through here on their own turn)
+		-- and not on the group. `direct` never reaches this function —
+		-- direct_outbound() is appended by the callers directly.
+		if timeout and ob.type ~= "urltest" and ob.type ~= "selector" then
+			ob.connect_timeout = timeout
 		end
 		outbounds[#outbounds + 1] = ob
 	end
@@ -952,12 +1029,18 @@ local function build_basic_outbounds(c)
 	local members, all_map, all_ordered = resolve_basic_members(c)
 
 	if #members > 1 then
+		-- `interval` is deliberately omitted so sing-box applies its own 3m
+		-- default. Basic mode exposes no Interval box, so a value hard-coded
+		-- here is one no Basic user can reach, and the 5m this carried was
+		-- simply slower than upstream at leaving a degraded-but-alive node.
+		-- Omitting it also matches what Advanced emits for an empty Interval
+		-- field. `tolerance` is set to sing-box's own default purely to keep
+		-- the synthesised group self-documenting.
 		local group = {
 			type      = "urltest",
 			tag       = BASIC_AUTO_TAG,
 			outbounds = members,
 			url       = "https://www.gstatic.com/generate_204",
-			interval  = "5m",
 			tolerance = 50
 		}
 		all_map[BASIC_AUTO_TAG] = group
@@ -970,11 +1053,12 @@ local function build_basic_outbounds(c)
 	-- config no longer needs to carry unreferenced nodes.
 	local member_set = {}
 	for _, t in ipairs(members) do member_set[t] = true end
+	local timeout   = connect_timeout(c)
 	local outbounds = { direct_outbound() }
 	local endpoints = {}
 	for _, ob in ipairs(all_ordered) do
 		if member_set[ob.tag] or ob.tag == BASIC_AUTO_TAG then
-			place_node(ob, outbounds, endpoints)
+			place_node(ob, outbounds, endpoints, timeout)
 		end
 	end
 
@@ -1170,6 +1254,7 @@ local function build_outbounds(c)
 	-- block is no longer a builtin outbound — a rule that drops traffic now
 	-- compiles to a reject rule action (see build_route). sing-box removed
 	-- the legacy `block` special outbound in 1.13.
+	local timeout   = connect_timeout(c)
 	local outbounds = { direct_outbound() }
 	local endpoints = {}
 	-- Only referenced nodes reach the running config — unreferenced
@@ -1190,7 +1275,7 @@ local function build_outbounds(c)
 				io.stderr:write("prism build-config: urltest '" .. ob.tag ..
 					"' has no usable members; dropping the group\n")
 			else
-				place_node(ob, outbounds, endpoints)
+				place_node(ob, outbounds, endpoints, timeout)
 			end
 		end
 	end
@@ -2044,6 +2129,13 @@ local function build_probe_config(c)
 		-- Groups are skipped: their concrete members are all emitted
 		-- individually, and an unexpanded urltest would be rejected.
 		if ob.type ~= "urltest" then
+			-- No connect_timeout here, deliberately: the probe instance
+			-- already has an explicit per-probe budget (test-all-runner's
+			-- PROBE_TIMEOUT_MS, with REQ_TIMEOUT_S outside it), tuned against
+			-- real batch contention. A second, shorter deadline underneath it
+			-- would fail the dial before that budget is spent and record a
+			-- distant-but-healthy node as down — the exact flapping the
+			-- PROBE_TIMEOUT_MS comment documents having already paid for.
 			place_node(ob, outbounds, endpoints)
 		end
 	end
