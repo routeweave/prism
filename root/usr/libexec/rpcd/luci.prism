@@ -1110,6 +1110,23 @@ local function log_prism(level, msg)
 	os.execute("logger -p daemon." .. level .. " -t prism '" .. safe .. "' 2>/dev/null")
 end
 
+-- Reduce a subscription URL to its scheme for logging. A subscription URL is
+-- a bearer credential: anyone holding it gets the user's paid service and
+-- their whole node list. It reaches the Status page log box through get_logs,
+-- so a logged URL is one support screenshot away from being handed out — and
+-- syslog is also forwarded off-box wherever log_proto/log_ip are configured.
+-- The host is dropped too, not just the token: the host alone still names the
+-- provider, which is the same disclosure in a thinner disguise. Nothing of
+-- diagnostic value is lost, because every one of these messages already
+-- carries the subscription's display name; the scheme is kept because "is
+-- this subscription fetched over plain http?" is a real thing to spot.
+local function redact_url(url)
+	if type(url) ~= "string" or url == "" then return "<none>" end
+	local scheme = url:match("^(%a[%w+.-]*)://")
+	if not scheme then return "<redacted>" end
+	return scheme .. "://<redacted>"
+end
+
 -- Migrate legacy `type=selector` node sections to `type=urltest`. Selector
 -- creation was removed from the UI and the type is no longer in the Type
 -- dropdown, so an existing selector section would otherwise render with no
@@ -1544,7 +1561,7 @@ local function sync_one(id)
 		return { status = "error", node_count = 0 }
 	end
 
-	log_prism("info", "sync '" .. sub_name .. "': fetching " .. url)
+	log_prism("info", "sync '" .. sub_name .. "': fetching " .. redact_url(url))
 
 	-- uclient-fetch is always present on OpenWrt (part of uclient).
 	-- Write to a temp file so we can cap size and check the exit code cleanly.
@@ -1892,15 +1909,51 @@ local methods = {
 			local n = tonumber(args.lines) or 20
 			if n > 500 then n = 500 end
 
+			-- Keys are the POSIX severity names syslog actually emits,
+			-- which is what the daemon.<sev> match below yields. The
+			-- `error`/`warn` aliases exist because the Settings dropdown
+			-- writes sing-box's spelling (it sits directly beneath the
+			-- sing-box log-level control, which legitimately uses those
+			-- names) — without them SEV["error"] is nil, the lookup below
+			-- falls through to its `or 6` default, and "Error", the
+			-- strictest setting offered, silently filters nothing at all.
 			local SEV = {
 				emerg = 0, alert = 1, crit = 2, err = 3,
-				warning = 4, notice = 5, info = 6, debug = 7
+				warning = 4, notice = 5, info = 6, debug = 7,
+				error = 3, warn = 4
 			}
 			local c = uci_cursor()
 			local threshold = SEV[c:get("prism", "global", "prism_log_level") or "info"] or 6
 			c:close()
 
-			local prism, singbox = {}, {}
+			-- Retain only the last n lines of each category while
+			-- scanning, in a fixed-size ring buffer, instead of appending
+			-- every match and trimming at the end. The split has to happen
+			-- here rather than in the pipeline — a single `tail` before the
+			-- split cannot guarantee n of *each* category — so the scan
+			-- still walks the whole syslog ring buffer, but it no longer
+			-- allocates a table slot per line to do it. That mattered:
+			-- on a box whose sing-box is logging steadily, the sing-box
+			-- side is the overwhelming majority of matches and essentially
+			-- all of them were appended only to be discarded, on every
+			-- single 2s Status poll.
+			if n < 1 then n = 1 end
+			local function ring() return { buf = {}, len = 0 } end
+			local function push(r, line)
+				r.len = r.len + 1
+				r.buf[(r.len - 1) % n + 1] = line
+			end
+			local function drain(r)
+				local out = {}
+				local count = r.len < n and r.len or n
+				local start = r.len <= n and 0 or r.len - n
+				for i = 1, count do
+					out[i] = r.buf[(start + i - 1) % n + 1]
+				end
+				return out
+			end
+
+			local prism, singbox = ring(), ring()
 			-- Prefilter in the pipeline so the per-line Lua loop below only
 			-- sees candidate lines — this runs on every 2s Status-page poll
 			-- and the full syslog ring buffer can be hundreds of KB. The
@@ -1914,25 +1967,17 @@ local methods = {
 					if line:find(" prism: ", 1, true) then
 						local sev = line:match("daemon%.(%w+) ")
 						if not sev or (SEV[sev] or 6) <= threshold then
-							prism[#prism + 1] = line
+							push(prism, line)
 						end
 					elseif line:find("sing-box[", 1, true) or
 					       line:find(" sing-box: ", 1, true) then
-						singbox[#singbox + 1] = line
+						push(singbox, line)
 					end
 				end
 				f:close()
 			end
 
-			-- Trim each list to its last n entries.
-			local function tail(t)
-				local len = #t
-				if len <= n then return t end
-				local out = {}
-				for i = len - n + 1, len do out[#out + 1] = t[i] end
-				return out
-			end
-			return { prism = tail(prism), singbox = tail(singbox) }
+			return { prism = drain(prism), singbox = drain(singbox) }
 		end
 	},
 

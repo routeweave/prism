@@ -1873,10 +1873,28 @@ local LOG_LEVELS = {
 	error = true, fatal = true, panic = true
 }
 
+-- `timestamp = false`: sing-box's log goes to stdout, procd hands that to
+-- syslog, and logread already stamps every line — so a timestamped line
+-- carries two clock readings, and they disagree (syslog prints local time,
+-- sing-box prints UTC), which is worse than merely redundant when reading
+-- raw logread output. The Status page never showed the second one anyway:
+-- LOG_RE in status.js has always matched it as an optional group and
+-- dropped it. What is reclaimed is space in the syslog ring buffer, which
+-- is the binding constraint on how much history survives — a steadily
+-- logging sing-box can evict the whole buffer in well under an hour,
+-- taking Prism's own control-plane narrative with it.
+--
+-- Colour is NOT configurable here: sing-box has no `log.disable_color`
+-- (it rejects the key outright) and ignores NO_COLOR, TERM and CLICOLOR,
+-- so its ANSI escapes reach syslog regardless. status.js strips them on
+-- display via ANSI_RE; there is nothing to do about them at config level.
+--
+-- A user who routes the log to a file via extra.json's log.output can set
+-- `timestamp` back to true in the same merge slot.
 local function build_log(c)
 	local level = c:get("prism", "global", "log_level")
 	if not level or not LOG_LEVELS[level] then level = "warn" end
-	return { level = level, timestamp = true }
+	return { level = level, timestamp = false }
 end
 
 
@@ -2058,7 +2076,7 @@ local function build_probe_config(c)
 	end
 
 	local config = {
-		log       = { level = "warn", timestamp = true },
+		log       = { level = "warn", timestamp = false },
 		dns       = { servers = { build_local_dns_entry(c) }, final = "local" },
 		outbounds = outbounds,
 		route     = route,
