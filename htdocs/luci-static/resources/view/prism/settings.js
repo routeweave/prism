@@ -284,6 +284,40 @@ return baseclass.extend({
 		oDetour.value('direct',  _('Direct (WAN)'));
 		oDetour['default'] = 'default';
 
+		// ── Node dialling ────────────────────────────────────────────────
+		// Also binds `global` (see the Rule-sets note above on sharing one
+		// UCI section across several form sections — `connect_timeout` is
+		// not reused as an option name anywhere else, which is what keeps
+		// the per-option DOM ids unique).
+		var sDial = m.section(form.NamedSection, 'global', 'prism', _('Node dialling'),
+			_('How long to wait for a node to answer before giving up on it ' +
+			  'and moving on.'));
+		sDial.addremove = false;
+
+		// Clearing the field removes the option, and so does typing the
+		// default back in — form.js calls remove() for both — so an emptied
+		// box means "shipped default", not "no limit". `0` is the opt-out,
+		// which is why the description names it rather than saying "leave
+		// empty". build-config reads the two states the same way.
+		var oConnTimeout = advance(sDial.option(form.Value, 'connect_timeout',
+			_('Connect timeout'),
+			_('Applied to every proxy node. A node that refuses connections is ' +
+			  'dropped from its auto group immediately, but one that silently ' +
+			  'discards traffic is not — without this, each attempt waits out ' +
+			  'the kernel\'s retry schedule (around two minutes) with the app ' +
+			  'hung behind it. Set 0 for no limit.')));
+		oConnTimeout.placeholder = '5s';
+		oConnTimeout['default']  = '5s';
+		oConnTimeout.optional    = true;
+		oConnTimeout.validate = function(section_id, value) {
+			if (value == null || value === '' || value === '0')
+				return true;
+			// Go duration: one or more <number><unit> pairs, e.g. 5s, 1m30s.
+			if (!/^(\d+(\.\d+)?(ns|us|ms|s|m|h))+$/.test(value))
+				return _('Expected a duration such as "5s" or "1m30s", or 0 for no limit');
+			return true;
+		};
+
 		// ── Latency testing ──────────────────────────────────────────────
 		// Whole section is Advanced (same prism-advanced wrapper-class
 		// trick as Logging). The flag binds to `global` and feeds
