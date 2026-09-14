@@ -1110,23 +1110,6 @@ local function log_prism(level, msg)
 	os.execute("logger -p daemon." .. level .. " -t prism '" .. safe .. "' 2>/dev/null")
 end
 
--- Reduce a subscription URL to its scheme for logging. A subscription URL is
--- a bearer credential: anyone holding it gets the user's paid service and
--- their whole node list. It reaches the Status page log box through get_logs,
--- so a logged URL is one support screenshot away from being handed out — and
--- syslog is also forwarded off-box wherever log_proto/log_ip are configured.
--- The host is dropped too, not just the token: the host alone still names the
--- provider, which is the same disclosure in a thinner disguise. Nothing of
--- diagnostic value is lost, because every one of these messages already
--- carries the subscription's display name; the scheme is kept because "is
--- this subscription fetched over plain http?" is a real thing to spot.
-local function redact_url(url)
-	if type(url) ~= "string" or url == "" then return "<none>" end
-	local scheme = url:match("^(%a[%w+.-]*)://")
-	if not scheme then return "<redacted>" end
-	return scheme .. "://<redacted>"
-end
-
 -- Migrate legacy `type=selector` node sections to `type=urltest`. Selector
 -- creation was removed from the UI and the type is no longer in the Type
 -- dropdown, so an existing selector section would otherwise render with no
@@ -1561,7 +1544,15 @@ local function sync_one(id)
 		return { status = "error", node_count = 0 }
 	end
 
-	log_prism("info", "sync '" .. sub_name .. "': fetching " .. redact_url(url))
+	-- No URL in the log line. A subscription URL is a bearer credential:
+	-- anyone holding it gets the user's paid service and their whole node
+	-- list. get_logs feeds syslog straight into the Status page log box, so a
+	-- logged URL is one support screenshot away from being handed out, and
+	-- syslog is forwarded off-box wherever log_proto/log_ip are set. Redacting
+	-- it down to the scheme was tried and read as a broken URL rather than as
+	-- a deliberate omission; nothing diagnostic is lost by dropping it, since
+	-- the line already names the subscription.
+	log_prism("info", "sync '" .. sub_name .. "': fetching")
 
 	-- uclient-fetch is always present on OpenWrt (part of uclient).
 	-- Write to a temp file so we can cap size and check the exit code cleanly.
